@@ -101,19 +101,74 @@ function shortName(mcName) {
 }
 
 class Builder {
-  constructor(bot, log) {
-    this.bot = bot;
+  // No bot required up front: the same Builder instance survives reconnects,
+  // so a build's progress, chest memory and scaffold tracking are never lost
+  // just because the connection dropped. Call setBot() whenever a new bot
+  // instance comes online (initial join and every reconnect).
+  constructor(log) {
+    this.bot = null;
     this.log = log;
     this.chests = new Map(); // "x,y,z" -> { pos, items: Map<name,count> }
-    this.job = null; // { blocks, needed, placed, missing, running, paused }
+    this.job = null; // { blocks, needed, placed, missing, running, paused, offset }
     this.scaffold = new Set(); // "x,y,z" of temporary blocks placed to reach a spot
+    this.resumeOnSpawn = false; // was mid-build when we got disconnected
+  }
+
+  setBot(bot) {
+    this.bot = bot;
     bot.loadPlugin(pathfinder);
+    if (this.resumeOnSpawn && this.job) {
+      this.resumeOnSpawn = false;
+      this.log("reconnected mid-build, resuming automatically");
+      this.runBuild(this.job.offset || { x: 0, y: 0, z: 0 }).catch((e) =>
+        this.log("resumed build error: " + e.message)
+      );
+    }
+  }
+
+  // Called when the connection drops while a build is running, so we know
+  // to pick back up automatically once setBot() is called again.
+  onDisconnected() {
+    if (this.job && this.job.running) {
+      this.job.running = false;
+      this.resumeOnSpawn = true;
+      this.log("disconnected mid-build, will resume automatically on reconnect");
+    }
   }
 
   setMovements() {
     const mcData = require("minecraft-data")(this.bot.version);
     const movements = new Movements(this.bot, mcData);
     this.bot.pathfinder.setMovements(movements);
+  }
+
+  // Pause building (without treating it as a failure) while food/health is
+  // dangerously low, eating from inventory if possible, and resuming once
+  // it's safe. Bounded wait so a truly stuck situation still surfaces
+  // rather than hanging forever silently.
+  async waitIfUnsafe() {
+    const start = Date.now();
+    while (this.bot.health <= 6 || this.bot.food <= 3) {
+      if (Date.now() - start > 120000) {
+        this.log("health/food still low after 2 minutes of waiting, continuing anyway");
+        return;
+      }
+      if (this.bot.food <= 14) {
+        const foodItem = this.bot.inventory
+          .items()
+          .find((i) => /bread|apple|carrot|potato|beef|pork|chicken|mutton|cod|salmon|stew/.test(i.name));
+        if (foodItem) {
+          try {
+            await this.bot.equip(foodItem, "hand");
+            await this.bot.consume();
+          } catch (e) {
+            /* best effort */
+          }
+        }
+      }
+      this.log(`pausing: health=${this.bot.health} food=${this.bot.food}, waiting to recover`);
+      await new Promise((r) => setTimeout(r, 3000));
+    }
   }
 
   async gotoNear(pos, range = 2, timeoutMs = 20000) {
@@ -125,10 +180,44 @@ class Builder {
     ]);
   }
 
-  // Try to reach `pos`; if the normal path fails or times out, drop a scaffold
-  // block under the bot (bridging toward the target) and retry once. Any
-  // scaffold block placed this way is tracked and removed once the build
-  // finishes, so the bot never permanently alters the world to get there.
+  // Place one block directly under the bot's feet by jumping and placing
+  // mid-air against the block it just left. Standard "pillar jump" technique.
+  // Tracked as scaffold so it gets removed once the build finishes.
+  async pillarUpOnce(junk, log) {
+    const { Vec3 } = require("vec3");
+    const startBelow = this.bot.entity.position.offset(0, -1, 0).floored();
+    const belowBlock = this.bot.blockAt(startBelow);
+    if (!belowBlock || belowBlock.boundingBox !== "block") return false;
+    await this.bot.equip(junk, "hand");
+    this.bot.setControlState("jump", true);
+    const start = Date.now();
+    // Wait until the bot has risen enough to place below itself without
+    // colliding with its own hitbox, but bail out if something's wrong.
+    while (this.bot.entity.position.y < startBelow.y + 1.2) {
+      if (Date.now() - start > 2000) {
+        this.bot.setControlState("jump", false);
+        return false;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    try {
+      await this.bot.placeBlock(belowBlock, new Vec3(0, 1, 0));
+      const placedAt = startBelow.offset(0, 1, 0);
+      this.scaffold.add(`${placedAt.x},${placedAt.y},${placedAt.z}`);
+      if (log) log(`pillared up to ${placedAt.x},${placedAt.y},${placedAt.z}`);
+      return true;
+    } catch (e) {
+      return false;
+    } finally {
+      this.bot.setControlState("jump", false);
+    }
+  }
+
+  // Try to reach `pos`. If the normal path fails, alternate short bridging
+  // (horizontal gaps) and pillaring (vertical gaps, climbing straight up)
+  // toward the target for a bounded number of steps, retrying the real
+  // pathfinder goto after each adjustment. Every temporary block placed
+  // this way is tracked and removed once the build finishes.
   async gotoNearOrBridge(pos, range, log) {
     try {
       await this.gotoNear(pos, range);
@@ -139,32 +228,48 @@ class Builder {
         .items()
         .find((i) => /dirt|cobblestone|netherrack|stone|planks/.test(i.name));
       if (!junk) return false;
-      const foot = this.bot.entity.position.floored();
-      const dir = pos.minus(foot);
-      const step = new Vec3(
-        Math.sign(dir.x) || 0,
-        0,
-        Math.sign(dir.z) || 0
-      );
-      const bridgeAt = foot.offset(step.x, -1, step.z);
-      const existing = this.bot.blockAt(bridgeAt);
-      if (existing && existing.boundingBox !== "block") {
-        try {
-          await this.bot.equip(junk, "hand");
-          const below = this.bot.blockAt(foot.offset(0, -1, 0));
-          if (below && below.boundingBox === "block") {
-            await this.bot.placeBlock(below, new Vec3(step.x, 0, step.z));
+
+      const MAX_STEPS = 12;
+      for (let step = 0; step < MAX_STEPS; step++) {
+        const foot = this.bot.entity.position.floored();
+        const dir = pos.minus(foot);
+
+        if (dir.y > 1) {
+          // Target is above us: pillar up.
+          const ok = await this.pillarUpOnce(junk, log);
+          if (!ok) break;
+        } else if (Math.abs(dir.x) + Math.abs(dir.z) > range) {
+          // Target is horizontally distant: bridge one step toward it.
+          const bStep = new Vec3(Math.sign(dir.x) || 0, 0, Math.sign(dir.z) || 0);
+          const bridgeAt = foot.offset(bStep.x, -1, bStep.z);
+          const existing = this.bot.blockAt(bridgeAt);
+          if (!existing || existing.boundingBox === "block") break; // already solid or unreadable, stop guessing
+          try {
+            await this.bot.equip(junk, "hand");
+            const below = this.bot.blockAt(foot.offset(0, -1, 0));
+            if (!below || below.boundingBox !== "block") break;
+            await this.bot.placeBlock(below, new Vec3(bStep.x, 0, bStep.z));
             this.scaffold.add(`${bridgeAt.x},${bridgeAt.y},${bridgeAt.z}`);
             if (log) log(`bridged toward ${pos.x},${pos.y},${pos.z} with a temporary block`);
+          } catch (e2) {
+            break;
           }
-        } catch (e2) {
-          /* best effort, fall through to retry */
+        } else {
+          break; // close enough that pathfinder should take it from here
+        }
+
+        try {
+          await this.gotoNear(pos, range, 6000);
+          return true;
+        } catch (e3) {
+          continue; // keep adjusting
         }
       }
+
       try {
         await this.gotoNear(pos, range);
         return true;
-      } catch (e3) {
+      } catch (e4) {
         return false;
       }
     }
@@ -352,8 +457,9 @@ class Builder {
     if (this.job.running) throw new Error("Build already running.");
     this.job.running = true;
     this.job.paused = false;
-    this.job.missing = [];
-    this.job.skipped = [];
+    this.job.offset = originOffset;
+    this.job.missing = this.job.missing || [];
+    this.job.skipped = this.job.skipped || [];
 
     const blocks = this.job.blocks;
     const MAX_ATTEMPTS = 3;
@@ -365,6 +471,15 @@ class Builder {
         this.job.running = false;
         return { stopped: true, placed: this.job.placed, total: blocks.length };
       }
+      if (!this.bot || !this.bot.entity) {
+        // Connection dropped out from under us; stop cleanly and let
+        // setBot() on the next reconnect pick this back up automatically.
+        this.job.running = false;
+        this.resumeOnSpawn = true;
+        this.log("bot not connected, pausing build until reconnect");
+        return { stopped: true, disconnected: true, placed: this.job.placed, total: blocks.length };
+      }
+      await this.waitIfUnsafe();
       const b = blocks[i];
       const target = { x: b.x + originOffset.x, y: b.y + originOffset.y, z: b.z + originOffset.z };
       const shortN = shortName(b.name);
