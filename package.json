@@ -1,0 +1,23 @@
+{
+  "name": "mc-join-bot",
+  "version": "3.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "express": "^4.19.2",
+    "mineflayer": "^4.20.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "minecraft-data": "^3.78.0",
+    "prismarine-nbt": "^2.7.0",
+    "vec3": "^0.1.10",
+    "multer": "^1.4.5-lts.1",
+    "zod": "^3.23.8"
+  }
+}
