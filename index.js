@@ -280,6 +280,17 @@ function buildServer() {
     return text("Stopping after the current block.");
   });
 
+  s.tool(
+    "build_cleanup",
+    "Remove any temporary scaffold blocks left over from an interrupted build",
+    {},
+    async () => {
+      if (!builder) return text("Bot is not in the world.");
+      await builder.cleanupScaffold();
+      return text("Scaffold cleanup done.");
+    }
+  );
+
   return s;
 }
 
