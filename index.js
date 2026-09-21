@@ -23,7 +23,7 @@ if (!USERNAME || !PASSWORD || !MCP_SECRET) {
 
 // ---------- bot state ----------
 let bot = null;
-let builder = null;
+const builder = new Builder(log);
 let status = "offline";
 let wantOnline = true;
 let delay = 15000;
@@ -46,7 +46,6 @@ function start() {
   let banned = false;
   let joined = false;
 
-  let localBuilder;
   const b = mineflayer.createBot({
     host: HOST,
     port: PORT,
@@ -103,12 +102,7 @@ function start() {
     }
   });
 
-  b.once("spawn", () => {
-    if (!localBuilder) {
-      localBuilder = new Builder(b, log);
-      builder = localBuilder;
-    }
-  });
+  b.once("spawn", () => builder.setBot(b));
 
   const markOnline = (why) => {
     if (joined) return;
@@ -138,6 +132,7 @@ function start() {
     clearTimeout(watchdog);
     if (bot === b) bot = null;
     status = "offline";
+    builder.onDisconnected();
     if (banned) {
       wantOnline = false;
       log("looks like a ban, not reconnecting");
@@ -223,7 +218,7 @@ function buildServer() {
     "Walk to nearby chests and remember what is inside each one, for building from a schematic",
     { radius: z.number().int().min(1).max(48).optional() },
     async ({ radius }) => {
-      if (!builder) return text("Bot is not in the world.");
+      if (!builder.bot) return text("Bot is not in the world.");
       const n = await builder.scanChests(radius || 16);
       const totals = builder.chestSummary();
       return text({ chestsScanned: n, totals: Object.fromEntries(totals) });
@@ -231,7 +226,7 @@ function buildServer() {
   );
 
   s.tool("chest_memory", "Show all chests the bot has scanned and their contents", {}, async () => {
-    if (!builder) return text("Bot is not in the world.");
+    if (!builder.bot) return text("Bot is not in the world.");
     const out = [...builder.chests.values()].map((c) => ({ pos: c.pos, items: Object.fromEntries(c.items) }));
     return text(out);
   });
@@ -270,12 +265,12 @@ function buildServer() {
   );
 
   s.tool("build_status", "Check progress of the current build job", {}, async () => {
-    if (!builder) return text("Bot is not in the world.");
+    if (!builder.bot) return text("Bot is not in the world.");
     return text(builder.status());
   });
 
   s.tool("build_stop", "Pause the current build job after the block in progress finishes", {}, async () => {
-    if (!builder) return text("Bot is not in the world.");
+    if (!builder.bot) return text("Bot is not in the world.");
     builder.stopBuild();
     return text("Stopping after the current block.");
   });
@@ -285,7 +280,7 @@ function buildServer() {
     "Remove any temporary scaffold blocks left over from an interrupted build",
     {},
     async () => {
-      if (!builder) return text("Bot is not in the world.");
+      if (!builder.bot) return text("Bot is not in the world.");
       await builder.cleanupScaffold();
       return text("Scaffold cleanup done.");
     }
@@ -306,7 +301,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 *
 app.post(`/schematic/${MCP_SECRET}`, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "no file uploaded (field name: file)" });
-    if (!builder) return res.status(409).json({ error: "bot is not in the world yet" });
+    if (!builder.bot) return res.status(409).json({ error: "bot is not in the world yet" });
     const info = await builder.loadSchematic(req.file.buffer);
     log(`schematic loaded: ${info.blockCount} blocks`);
     res.json(info);
