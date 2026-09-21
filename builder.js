@@ -64,12 +64,10 @@ async function parseLitematic(buffer) {
     const width = Math.abs(sx), height = Math.abs(sy), depth = Math.abs(sz);
     const volume = width * height * depth;
 
-    const palette = region.BlockStatePalette.map((p) => {
-      const props = p.Properties
-        ? Object.entries(p.Properties).map(([k, v]) => `${k}=${v}`).join(",")
-        : "";
-      return { name: p.Name, propsStr: props };
-    });
+    const palette = region.BlockStatePalette.map((p) => ({
+      name: p.Name,
+      props: p.Properties || null,
+    }));
     const bits = bitsNeeded(palette.length);
 
     // BlockStates comes back from nbt.simplify as an array of [hi, lo] pairs
@@ -88,7 +86,7 @@ async function parseLitematic(buffer) {
           const wx = ox + (sx < 0 ? -x : x);
           const wy = oy + (sy < 0 ? -y : y);
           const wz = oz + (sz < 0 ? -z : z);
-          blocks.push({ x: wx, y: wy, z: wz, name: entry.name });
+          blocks.push({ x: wx, y: wy, z: wz, name: entry.name, props: entry.props });
           needed.set(entry.name, (needed.get(entry.name) || 0) + 1);
         }
       }
@@ -108,6 +106,7 @@ class Builder {
     this.log = log;
     this.chests = new Map(); // "x,y,z" -> { pos, items: Map<name,count> }
     this.job = null; // { blocks, needed, placed, missing, running, paused }
+    this.scaffold = new Set(); // "x,y,z" of temporary blocks placed to reach a spot
     bot.loadPlugin(pathfinder);
   }
 
@@ -117,9 +116,58 @@ class Builder {
     this.bot.pathfinder.setMovements(movements);
   }
 
-  async gotoNear(pos, range = 2) {
+  async gotoNear(pos, range = 2, timeoutMs = 20000) {
     this.setMovements();
-    await this.bot.pathfinder.goto(new goals.GoalNear(pos.x, pos.y, pos.z, range));
+    const goal = new goals.GoalNear(pos.x, pos.y, pos.z, range);
+    await Promise.race([
+      this.bot.pathfinder.goto(goal),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("goto timeout")), timeoutMs)),
+    ]);
+  }
+
+  // Try to reach `pos`; if the normal path fails or times out, drop a scaffold
+  // block under the bot (bridging toward the target) and retry once. Any
+  // scaffold block placed this way is tracked and removed once the build
+  // finishes, so the bot never permanently alters the world to get there.
+  async gotoNearOrBridge(pos, range, log) {
+    try {
+      await this.gotoNear(pos, range);
+      return true;
+    } catch (e) {
+      const { Vec3 } = require("vec3");
+      const junk = this.bot.inventory
+        .items()
+        .find((i) => /dirt|cobblestone|netherrack|stone|planks/.test(i.name));
+      if (!junk) return false;
+      const foot = this.bot.entity.position.floored();
+      const dir = pos.minus(foot);
+      const step = new Vec3(
+        Math.sign(dir.x) || 0,
+        0,
+        Math.sign(dir.z) || 0
+      );
+      const bridgeAt = foot.offset(step.x, -1, step.z);
+      const existing = this.bot.blockAt(bridgeAt);
+      if (existing && existing.boundingBox !== "block") {
+        try {
+          await this.bot.equip(junk, "hand");
+          const below = this.bot.blockAt(foot.offset(0, -1, 0));
+          if (below && below.boundingBox === "block") {
+            await this.bot.placeBlock(below, new Vec3(step.x, 0, step.z));
+            this.scaffold.add(`${bridgeAt.x},${bridgeAt.y},${bridgeAt.z}`);
+            if (log) log(`bridged toward ${pos.x},${pos.y},${pos.z} with a temporary block`);
+          }
+        } catch (e2) {
+          /* best effort, fall through to retry */
+        }
+      }
+      try {
+        await this.gotoNear(pos, range);
+        return true;
+      } catch (e3) {
+        return false;
+      }
+    }
   }
 
   // Scan chests within radius blocks of the bot's current position.
@@ -136,7 +184,11 @@ class Builder {
     for (const p of positions) {
       const pos = new Vec3(p.x, p.y, p.z);
       try {
-        await this.gotoNear(pos, 2);
+        const reached = await this.gotoNearOrBridge(pos, 2, this.log);
+        if (!reached) {
+          this.log(`could not reach chest at ${pos.x},${pos.y},${pos.z}, skipping`);
+          continue;
+        }
         const block = this.bot.blockAt(pos);
         const container = await this.bot.openContainer(block);
         const items = new Map();
@@ -165,7 +217,16 @@ class Builder {
   async loadSchematic(buffer) {
     const { blocks, needed } = await parseLitematic(buffer);
     this.job = { blocks, needed, placed: 0, missing: [], running: false, paused: false };
-    return { blockCount: blocks.length, needed: Object.fromEntries([...needed].map(([k, v]) => [shortName(k), v])) };
+    const riskyTypes = new Set(["minecraft:rail", "minecraft:powered_rail", "minecraft:detector_rail",
+      "minecraft:activator_rail", "minecraft:redstone_wire"]);
+    const risky = [...needed.keys()].filter((n) => riskyTypes.has(n)).map(shortName);
+    return {
+      blockCount: blocks.length,
+      needed: Object.fromEntries([...needed].map(([k, v]) => [shortName(k), v])),
+      orientationRisk: risky.length
+        ? `${risky.join(", ")} auto-shape from neighbors and may not come out as designed - check after building`
+        : null,
+    };
   }
 
   diffAgainstChests() {
@@ -190,7 +251,8 @@ class Builder {
   async withdrawFromChest(chestEntry, name, amount) {
     const { Vec3 } = require("vec3");
     const pos = new Vec3(chestEntry.pos.x, chestEntry.pos.y, chestEntry.pos.z);
-    await this.gotoNear(pos, 2);
+    const reached = await this.gotoNearOrBridge(pos, 2, this.log);
+    if (!reached) return 0;
     const block = this.bot.blockAt(pos);
     const container = await this.bot.openContainer(block);
     const slot = container.containerItems().find((i) => i.name === name);
@@ -206,46 +268,100 @@ class Builder {
     return take;
   }
 
-  async placeOne(target, name) {
+  // Horizontal facing -> yaw the bot should look before placing, for blocks
+  // (hopper, piston, observer, dispenser, repeater, comparator, chest...)
+  // whose horizontal orientation follows the placer's look direction when
+  // placed against a vertical (up/down) reference face.
+  static FACING_YAW = {
+    north: Math.PI,
+    south: 0,
+    east: -Math.PI / 2,
+    west: Math.PI / 2,
+  };
+
+  async placeOne(target, name, props) {
     const { Vec3 } = require("vec3");
     const pos = new Vec3(target.x, target.y, target.z);
+    const shortN = shortName(name);
     const existing = this.bot.blockAt(pos);
-    if (existing && existing.name === shortName(name)) return "already-correct";
 
-    await this.gotoNear(pos, 3);
-    const item = this.bot.inventory.items().find((i) => i.name === shortName(name));
+    const propsMatch = (block) => {
+      if (!props || !block || !block.getProperties) return true;
+      const actual = block.getProperties();
+      for (const k of Object.keys(props)) {
+        if (String(actual[k]) !== String(props[k])) return false;
+      }
+      return true;
+    };
+
+    if (existing && existing.name === shortN && propsMatch(existing)) return "already-correct";
+    if (existing && existing.name !== "air" && existing.name !== shortN) {
+      try {
+        if (await this.gotoNearOrBridge(pos, 3, this.log)) await this.bot.dig(existing, true);
+      } catch (e) {
+        /* best effort */
+      }
+    }
+
+    const reached = await this.gotoNearOrBridge(pos, 3, this.log);
+    if (!reached) return "unreachable";
+    const item = this.bot.inventory.items().find((i) => i.name === shortN);
     if (!item) return "no-item";
-
     await this.bot.equip(item, "hand");
-    // Find a neighboring solid block to place against.
-    const offsets = [
-      [0, -1, 0], [0, 1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1],
-    ];
+
+    const wantsHorizontal = props && props.facing && Builder.FACING_YAW[props.facing] !== undefined;
+    const offsets = wantsHorizontal
+      ? [[0, -1, 0], [0, 1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]]
+      : [[0, -1, 0], [0, 1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]];
+
+    let placedOk = false;
     for (const [dx, dy, dz] of offsets) {
       const refPos = pos.offset(dx, dy, dz);
       const refBlock = this.bot.blockAt(refPos);
-      if (refBlock && refBlock.boundingBox === "block") {
-        try {
-          await this.bot.placeBlock(refBlock, new Vec3(-dx, -dy, -dz));
-          return "placed";
-        } catch (e) {
-          continue;
+      if (!refBlock || refBlock.boundingBox !== "block") continue;
+      try {
+        if (wantsHorizontal) {
+          // Look away from the desired facing direction before placing:
+          // most facing= blocks orient to point away from the placer.
+          await this.bot.look(Builder.FACING_YAW[props.facing], 0, true);
         }
+        await this.bot.placeBlock(refBlock, new Vec3(-dx, -dy, -dz));
+        placedOk = true;
+        break;
+      } catch (e) {
+        continue;
       }
     }
-    return "no-support";
+    if (!placedOk) return "no-support";
+
+    // Verify; if the game picked a different facing than requested, note it
+    // rather than looping forever (rails/rotation-sensitive blocks in
+    // particular auto-shape based on neighbors and can't always be forced).
+    const placed = this.bot.blockAt(pos);
+    if (propsMatch(placed)) return "placed";
+    return "placed-facing-uncertain";
   }
 
+  // Never lets a single block hang the whole job: each block gets a bounded
+  // number of attempts (pathing/placement errors caught individually), then
+  // is recorded as skipped and the loop moves on. A per-block wall-clock cap
+  // guards against a single stuck action (e.g. bad pathfinder state) hanging
+  // forever even within an attempt.
   async runBuild(originOffset = { x: 0, y: 0, z: 0 }) {
     if (!this.job) throw new Error("No schematic loaded.");
     if (this.job.running) throw new Error("Build already running.");
     this.job.running = true;
     this.job.paused = false;
     this.job.missing = [];
+    this.job.skipped = [];
 
     const blocks = this.job.blocks;
+    const MAX_ATTEMPTS = 3;
+    const PER_ATTEMPT_TIMEOUT = 45000;
+
     for (let i = this.job.placed; i < blocks.length; i++) {
       if (this.job.paused) {
+        await this.cleanupScaffold();
         this.job.running = false;
         return { stopped: true, placed: this.job.placed, total: blocks.length };
       }
@@ -253,23 +369,75 @@ class Builder {
       const target = { x: b.x + originOffset.x, y: b.y + originOffset.y, z: b.z + originOffset.z };
       const shortN = shortName(b.name);
 
-      const have = this.bot.inventory.items().find((it) => it.name === shortN);
-      if (!have) {
-        const chest = this.findChestWith(b.name, 1);
-        if (!chest) {
-          this.job.missing.push(shortN);
-          this.job.placed = i + 1;
-          continue;
+      let result = "skipped";
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          const have = this.bot.inventory.items().find((it) => it.name === shortN);
+          if (!have) {
+            const chest = this.findChestWith(b.name, 1);
+            if (!chest) {
+              result = "no-material";
+              break;
+            }
+            await this.withdrawFromChest(chest, b.name, 64);
+          }
+          result = await Promise.race([
+            this.placeOne(target, b.name, b.props),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("placement timeout")), PER_ATTEMPT_TIMEOUT)),
+          ]);
+          if (result === "placed" || result === "already-correct" || result === "placed-facing-uncertain") break;
+          // "no-support" / "unreachable" / "no-item": worth a retry in case a
+          // neighbor gets placed later in a future pass, but don't loop forever now.
+        } catch (e) {
+          result = "error: " + e.message;
+          this.log(`attempt ${attempt}/${MAX_ATTEMPTS} failed for block ${i + 1} (${shortN}): ${e.message}`);
         }
-        await this.withdrawFromChest(chest, b.name, 64);
       }
 
-      const result = await this.placeOne(target, b.name);
       this.log(`block ${i + 1}/${blocks.length} (${shortN}) at ${target.x},${target.y},${target.z}: ${result}`);
+      if (result === "no-material") this.job.missing.push(shortN);
+      else if (result !== "placed" && result !== "already-correct" && result !== "placed-facing-uncertain") {
+        this.job.skipped.push({ index: i, name: shortN, pos: target, reason: result });
+      }
       this.job.placed = i + 1;
     }
+
+    await this.cleanupScaffold();
     this.job.running = false;
-    return { stopped: false, placed: this.job.placed, total: blocks.length, missing: [...new Set(this.job.missing)] };
+    return {
+      stopped: false,
+      placed: this.job.placed,
+      total: blocks.length,
+      missing: [...new Set(this.job.missing)],
+      skipped: this.job.skipped,
+    };
+  }
+
+  // Break every temporary bridging block placed during the build. Only
+  // removes blocks this run actually placed for scaffolding, and only if
+  // the schematic itself didn't legitimately want a block there.
+  async cleanupScaffold() {
+    const { Vec3 } = require("vec3");
+    const schemPositions = new Set((this.job ? this.job.blocks : []).map((b) => `${b.x},${b.y},${b.z}`));
+    for (const key of [...this.scaffold]) {
+      if (schemPositions.has(key)) {
+        this.scaffold.delete(key);
+        continue;
+      }
+      const [x, y, z] = key.split(",").map(Number);
+      const pos = new Vec3(x, y, z);
+      try {
+        const reached = await this.gotoNearOrBridge(pos, 3, this.log);
+        if (reached) {
+          const block = this.bot.blockAt(pos);
+          if (block && block.name !== "air") await this.bot.dig(block, true);
+        }
+        this.log(`removed temporary scaffold block at ${x},${y},${z}`);
+      } catch (e) {
+        this.log(`could not remove scaffold block at ${x},${y},${z}: ${e.message}`);
+      }
+      this.scaffold.delete(key);
+    }
   }
 
   stopBuild() {
@@ -284,6 +452,9 @@ class Builder {
       placed: this.job.placed,
       total: this.job.blocks.length,
       missing: [...new Set(this.job.missing)],
+      skippedCount: (this.job.skipped || []).length,
+      skipped: (this.job.skipped || []).slice(-20), // most recent, to keep responses small
+      scaffoldRemaining: this.scaffold.size,
     };
   }
 }
